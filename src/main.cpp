@@ -4,21 +4,15 @@
 using namespace std;
 using namespace json11;
 
-template<typename T> vector<T> operator+(const vector<T>& a, const vector<T>& b) {
-  vector<T> r = a;
-  r.insert(r.end(), b.begin(), b.end());
-  return r;
-}
-
 class WrongFormat{};
 class WrongType{};
 
 class Primitive;
 class Lambda;
-class Unknown;
-using TypeRaw = variant<Primitive, Lambda, Unknown>;
+class Record;
+class Variant;
+using TypeRaw = variant<Primitive, Lambda, Record, Variant>;
 using Type = shared_ptr<TypeRaw>;
-using Condition = vector<pair<Type, Type>>;
 
 template<typename T> Type wrap(T x) {
   return Type(new TypeRaw(x));
@@ -34,30 +28,19 @@ public:
   Type arg, body;
   Lambda(Type a, Type b): arg(a), body(b) {}
 };
-class Unknown {
+class Record {
 public:
-  static int count;
-  int num;
-  string name;
-  Type link;
-  Unknown(): num(count++) {}
+  map<string, Type> body;
+  Record(map<string, Type> b): body(b) {}
 };
-int Unknown::count = 0;
-
-Type find_parent(Type t) {
-  if(auto* p = get_if<Unknown>(t.get())) {
-    if(p->link == nullptr) {
-      return t;
-    }
-    return p->link = find_parent(p->link);
-	}
-  else {
-    return t;
-  }
-}
+class Variant {
+public:
+  map<string, Type> body;
+  Variant(map<string, Type> b): body(b) {}
+};
 
 template<typename T, typename R> R eval1_(function<R(T*)> f, Type a, R d) {
-	if(auto* p = get_if<T>(find_parent(a).get())) {
+	if(auto* p = get_if<T>(a.get())) {
 		return f(p);
 	}
 	return d;
@@ -73,7 +56,7 @@ template<typename T> auto eval1(T f, Type a) -> decltype(eval1_(function(f), a))
 }
 
 template<typename T, typename U, typename R> R eval1p1_(function<R(T*, U)> f, Type a, U b, R d) {
-	if(auto* p = get_if<T>(find_parent(a).get())) {
+	if(auto* p = get_if<T>(a.get())) {
 		return f(p, b);
 	}
 	return d;
@@ -89,8 +72,8 @@ template<typename T, typename U> auto eval1p1(T f, Type a, U b) -> decltype(eval
 }
 
 template<typename T, typename U, typename R> R eval2_(function<R(T*, U*)> f, Type a, Type b, R d) {
-	if(auto* p = get_if<T>(find_parent(a).get())) {
-		if(auto* q = get_if<U>(find_parent(b).get())) {
+	if(auto* p = get_if<T>(a.get())) {
+		if(auto* q = get_if<U>(b.get())) {
 			return f(p, q);
 		}
 	}
@@ -106,24 +89,44 @@ template<typename T> auto eval2(T f, Type a, Type b) -> decltype(eval2_(function
 	return eval2_(function(f), a, b);
 }
 
-bool operator==(Type a, Type b) {
+bool operator<=(Type a, Type b) {
   return
     eval2([](Primitive* x, Primitive* y){
       return x->name == y->name;
     }, a, b) ||
     eval2([](Lambda* x, Lambda* y){
-      return x->arg == y->arg && x->body == y->body;
+      return y->arg <= x->arg && x->body <= y->body;
     }, a, b) ||
-    eval2([](Unknown* x, Unknown* y){
-      return x->num == y->num;
+    eval2([](Record* x, Record* y){
+      for(auto i : y->body) {
+        auto it = x->body.find(i.first);
+        if(it == x->body.end() || !(it->second <= i.second)) {
+          return false;
+        }
+      }
+      return true;
+    }, a, b) ||
+    eval2([](Variant* x, Variant* y){
+      for(auto i : x->body) {
+        auto it = y->body.find(i.first);
+        if(it == y->body.end() || !(i.second <= it->second)) {
+          return false;
+        }
+      }
+      return true;
     }, a, b);
+}
+bool operator>=(Type a, Type b) {
+  return b <= a;
+}
+bool operator==(Type a, Type b) {
+  return a <= b && b <= a;
 }
 bool operator!=(Type a, Type b) {
   return !(a == b);
 }
 
 pair<string, bool> print_(const Type& t) {
-  static int now = 0;
   auto rp = eval1([](Primitive* x){
     return make_pair(x->name, true);
   }, t, make_pair((string)"", false));
@@ -137,14 +140,38 @@ pair<string, bool> print_(const Type& t) {
       return make_pair("(" + ar.first + ") -> " + br.first, false);
     }
   }, t, make_pair((string)"", false));
-  auto ru = eval1([](Unknown* x){
-    if(x->name == "") {
-      x->name = "`" + string(1, 'A' + now);
-      now++;
+  auto rr = eval1([](Record* x){
+    string r;
+    r += "{";
+    int c = 0;
+    for(auto i : x->body) {
+      r += i.first + ": " + print_(i.second).first;
+      if(c < (int)x->body.size() - 1) {
+        r += ", ";
+      }
+      c++;
     }
-    return make_pair(x->name, true);
+    r += "}";
+    return make_pair(r, true);
   }, t, make_pair((string)"", false));
-  return make_pair(rp.first + rl.first + ru.first, rp.second || rl.second || ru.second);
+  auto rv = eval1([](Variant* x){
+    string r;
+    r += "<";
+    int c = 0;
+    for(auto i : x->body) {
+      r += i.first + ": " + print_(i.second).first;
+      if(c < (int)x->body.size() - 1) {
+        r += ", ";
+      }
+      c++;
+    }
+    r += ">";
+    return make_pair(r, true);
+  }, t, make_pair((string)"", false));
+  return make_pair(
+    rp.first + rl.first + rr.first + rv.first,
+    rp.second || rl.second || rr.second || rv.second
+  );
 }
 string print(const Type& t) {
   return print_(t).first;
@@ -155,69 +182,163 @@ Type annotation(const Json& code) {
   if(rule == "lambda") {
     return wrap(Lambda(annotation(code["arg"]), annotation(code["body"])));
   }
-  else if(rule == "primitive") {
+  if(rule == "primitive") {
     return wrap(Primitive(code["value"].string_value()));
   }
-  else {
-    throw WrongFormat();
+  if(rule == "record") {
+    map<string, Type> m;
+    for(auto i : code["body"].array_items()) {
+      if(m.find(i["label"].string_value()) != m.end()) {
+        throw WrongFormat();
+      }
+      m[i["label"].string_value()] = annotation(i["type"]);
+    }
+    return wrap(Record(m));
   }
+  if(rule == "variant") {
+    map<string, Type> m;
+    for(auto i : code["body"].array_items()) {
+      m[i["label"].string_value()] = annotation(i["type"]);
+    }
+    return wrap(Variant(m));
+  }
+  throw WrongFormat();
 }
 
-void unify(Condition c);
-
-Type type_clone_(Type x, int b, map<int, Type>& to) {
-  return
-    eval1([&x](Primitive* _){return x;}, x,
-    eval1([&b, &to](Lambda* l){return wrap(Lambda(type_clone_(l->arg, b, to), type_clone_(l->body, b, to)));}, x,
-    eval1([&x, &b, &to](Unknown* u){
-      if(u->num < b) {
-        if(to.find(u->num) == to.end()) {
-          to[u->num] = wrap(Unknown());
-        }
-        return to[u->num];
+Type join(Type a, Type b);
+Type meet(Type a, Type b) {
+  auto rp = eval2([&a](Primitive* x, Primitive* y){
+    if(x->name == y->name) {
+      return make_pair(true, a);
+    }
+    return make_pair(false, Type());
+  }, a, b);
+  if(rp.first) {
+    return rp.second;
+  }
+  auto rl = eval2([](Lambda* x, Lambda* y){
+    return make_pair(true, wrap(Lambda(join(x->arg, y->arg), meet(x->body, y->body))));
+  }, a, b);
+  if(rl.first) {
+    return rl.second;
+  }
+  auto rr = eval2([](Record* x, Record* y){
+    map<string, Type> m;
+    for(auto i : x->body) {
+      auto it = y->body.find(i.first);
+      if(it == y->body.end()) {
+        m[i.first] = i.second;
       }
       else {
-        return x;
+        m[i.first] = meet(i.second, it->second);
       }
-    }, x
-  )));
+    }
+    for(auto i : y->body) {
+      auto it = x->body.find(i.first);
+      if(it == x->body.end()) {
+        m[i.first] = i.second;
+      }
+    }
+    return make_pair(true, wrap(Record(m)));
+  }, a, b);
+  if(rr.first) {
+    return rr.second;
+  }
+  auto rv = eval2([](Variant* x, Variant* y){
+    map<string, Type> m;
+    for(auto i : x->body) {
+      auto it = y->body.find(i.first);
+      if(it != y->body.end()) {
+        try {
+          m[i.first] = meet(i.second, it->second);
+        }
+        catch(WrongType _) {}
+      }
+    }
+    return make_pair(true, wrap(Variant(m)));
+  }, a, b);
+  if(rv.first) {
+    return rv.second;
+  }
+  throw WrongType();
 }
-Type type_clone(Type x) {
-  map<int, Type> to;
-  return type_clone_(x, Unknown::count, to);
+Type join(Type a, Type b) {
+  auto rp = eval2([&a](Primitive* x, Primitive* y){
+    if(x->name == y->name) {
+      return make_pair(true, a);
+    }
+    return make_pair(false, Type());
+  }, a, b);
+  if(rp.first) {
+    return rp.second;
+  }
+  auto rl = eval2([](Lambda* x, Lambda* y){
+    return make_pair(true, wrap(Lambda(meet(x->arg, y->arg), join(x->body, y->body))));
+  }, a, b);
+  if(rl.first) {
+    return rl.second;
+  }
+  auto rr = eval2([](Record* x, Record* y){
+    map<string, Type> m;
+    for(auto i : x->body) {
+      auto it = y->body.find(i.first);
+      if(it != y->body.end()) {
+        try {
+          m[i.first] = join(i.second, it->second);
+        }
+        catch(WrongType _) {}
+      }
+    }
+    return make_pair(true, wrap(Record(m)));
+  }, a, b);
+  if(rr.first) {
+    return rr.second;
+  }
+  auto rv = eval2([](Variant* x, Variant* y){
+    map<string, Type> m;
+    for(auto i : x->body) {
+      auto it = y->body.find(i.first);
+      if(it == y->body.end()) {
+        m[i.first] = i.second;
+      }
+      else {
+        m[i.first] = join(i.second, it->second);
+      }
+    }
+    for(auto i : y->body) {
+      auto it = x->body.find(i.first);
+      if(it == x->body.end()) {
+        m[i.first] = i.second;
+      }
+    }
+    return make_pair(true, wrap(Variant(m)));
+  }, a, b);
+  if(rv.first) {
+    return rv.second;
+  }
+  throw WrongType();
 }
 
-bool unique_check(const map<string, Type>& context, const map<string, Type>& def, string name) {
-  return context.find(name) == context.end() && def.find(name) == def.end();
+bool unique_check(const map<string, Type>& context, string name) {
+  return context.find(name) == context.end();
 }
-pair<Type, Condition> check(const Json& code, map<string, Type>& context, map<string, Type>& def) {
+Type check(const Json& code, map<string, Type>& context) {
   string rule = code["rule"].string_value();
   if(rule == "let") {
     string name;
-    Type argt;
-    if(
-      code["var"]["rule"].string_value() == "annotation" &&
-      code["var"]["body"]["rule"].string_value() == "variable"
-    ) {
-      name = code["var"]["body"]["value"].string_value();
-      argt = annotation(code["var"]["type"]);
-    }
-    else if(code["var"]["rule"].string_value() == "variable") {
+    if(code["var"]["rule"].string_value() == "variable") {
       name = code["var"]["value"].string_value();
-      argt = wrap(Unknown());
     }
-    if(name != "" && unique_check(context, def, name)) {
-      auto r = check(code["content"], context, def);
-      r.second.push_back(make_pair(r.first, argt));
-      unify(r.second);
-      context[name] = r.first;
-      auto ret = check(code["body"], context, def);
+    if(name != "" && unique_check(context, name)) {
+      auto t = check(code["content"], context);
+      context[name] = t;
+      auto r = check(code["body"], context);
       context.erase(name);
-      return ret;
+      return r;
     }
     throw WrongFormat();
   }
-  else if(rule == "lambda") {
+  if(rule == "lambda") {
     string name;
     Type argt;
     if(
@@ -227,123 +348,130 @@ pair<Type, Condition> check(const Json& code, map<string, Type>& context, map<st
       name = code["arg"]["body"]["value"].string_value();
       argt = annotation(code["arg"]["type"]);
     }
-    else if(code["arg"]["rule"].string_value() == "variable") {
-      name = code["arg"]["value"].string_value();
-      argt = wrap(Unknown());
-    }
-    if(name != "" && unique_check(context, def, name)) {
+    if(name != "" && unique_check(context, name)) {
       context[name] = argt;
-      auto r = check(code["body"], context, def);
+      auto r = check(code["body"], context);
       context.erase(name);
-      return make_pair(wrap(Lambda(argt, r.first)), r.second);
+      return wrap(Lambda(argt, r));
     }
     throw WrongFormat();
   }
-  else if(rule == "apply") {
-    auto funct = check(code["func"], context, def);
-    auto argt = check(code["arg"], context, def);
-    auto ret = wrap(Unknown());
-    return make_pair(
-      ret,
-      argt.second +
-      funct.second +
-      Condition{make_pair(funct.first, wrap(Lambda(argt.first, ret)))}
-    );
-  }
-  else if(rule == "variable") {
-    string name = code["value"].string_value();
-    if(context.find(name) != context.end()) {
-      return make_pair(context[name], Condition());
-    }
-    else if(def.find(name) != def.end()) {
-      return make_pair(type_clone(def[name]), Condition());
-    }
-    throw WrongFormat();
-  }
-  else if(rule == "constant") {
-    return make_pair(wrap(Primitive(code["type"].string_value())), Condition());
-  }
-  else {
-    throw WrongFormat();
-  }
-}
-
-bool is_contain(Unknown* x, Type a) {
-  return
-    eval1([](Primitive* p){return false;}, a) ||
-    eval1([&x](Lambda* l){return is_contain(x, l->arg) || is_contain(x, l->body);}, a) ||
-    eval1([&x](Unknown* u){return x->num == u->num;}, a);
-}
-
-void unify(Condition c) {
-  while(!c.empty()) {
-    auto s = c.back().first;
-    auto t = c.back().second;
-    c.pop_back();
-    if(s == t) {
-      continue;
-    }
-    auto f = [](Unknown* x, Type a){
-      if(!is_contain(x, a)) {
-        x->link = a;
-        return true;
+  if(rule == "apply") {
+    auto funct = check(code["func"], context);
+    auto argt = check(code["arg"], context);
+    auto r = eval1([&argt](Lambda* l){
+      if(argt <= l->arg) {
+        return make_pair(true, l->body);
       }
-      return false;
-    };
-    if(eval1p1(f, s, t)) {
-      continue;
-    }
-    if(eval1p1(f, t, s)) {
-      continue;
-    }
-    if(eval2([&c](Lambda* x, Lambda* y){
-      c.push_back(make_pair(x->arg, y->arg));
-      c.push_back(make_pair(x->body, y->body));
-      return true;
-    }, s, t)) {
-      continue;
+      return make_pair(false, Type());
+    }, funct);
+    if(r.first) {
+      return r.second;
     }
     throw WrongType();
   }
+  if(rule == "variable") {
+    string name = code["value"].string_value();
+    if(context.find(name) != context.end()) {
+      return context[name];
+    }
+    throw WrongFormat();
+  }
+  if(rule == "constant") {
+    return wrap(Primitive(code["type"].string_value()));
+  }
+  if(rule == "record") {
+    map<string, Type> m;
+    for(auto i : code["body"].array_items()) {
+      if(m.find(i["label"].string_value()) != m.end()) {
+        throw WrongFormat();
+      }
+      m[i["label"].string_value()] = check(i["content"], context);
+    }
+    return wrap(Record(m));
+  }
+  if(rule == "projrcd") {
+    auto vart = check(code["var"], context);
+    auto r = eval1([&code](Record* r){
+      auto it = r->body.find(code["label"].string_value());
+      if(it != r->body.end()) {
+        return make_pair(true, it->second);
+      }
+      return make_pair(false, Type());
+    }, vart);
+    if(r.first) {
+      return r.second;
+    }
+    throw WrongType();
+  }
+  if(rule == "variant") {
+    map<string, Type> m;
+    m[code["label"].string_value()] = check(code["content"], context);
+    return wrap(Variant(m));
+  }
+  if(rule == "if") {
+    auto condt = check(code["cond"], context);
+    if(condt == wrap(Primitive("Bool"))) {
+      auto t = check(code["true"], context);
+      auto f = check(code["false"], context);
+      return join(t, f);
+    }
+  }
+  if(rule == "case") {
+    auto t = check(code["content"], context);
+    auto r = eval1([&code, &context](Variant* v){
+      map<string, pair<string, Json>> m;
+      for(auto i : code["body"].array_items()) {
+        string name = i["label"].string_value();
+        if(m.find(name) != m.end()) {
+          throw WrongFormat();
+        }
+        m[name] = make_pair(i["var"].string_value(), i["content"]);
+      }
+      Type t = nullptr;
+      for(auto i : v->body) {
+        auto it = m.find(i.first);
+        if(it != m.end()) {
+          string name = it->second.first;
+          if(unique_check(context, name)) {
+            context[name] = i.second;
+            auto r = check(it->second.second, context);
+            context.erase(name);
+            if(t == nullptr) {
+              t = r;
+            }
+            else {
+              t = join(t, r);
+            }
+            continue;
+          }
+        }
+        throw WrongType();
+      }
+      if(v->body.size() < m.size()) {
+        cerr << "there are unused case" << endl;
+      }
+      if(t == nullptr) {
+        throw WrongType();
+      }
+      return make_pair(true, t);
+    }, t);
+    if(r.first) {
+      return r.second;
+    }
+    throw WrongType();
+  }
+  throw WrongFormat();
 }
 
 int main() {
   string json; getline(cin, json);
   string error;
   auto code = Json::parse(json, error);
-  map<string, Type> def;
   for(auto i : code.array_items()) {
     try{
       map<string, Type> context;
-      if(i["rule"].string_value() == "def") {
-        string name;
-        Type argt;
-        if(
-          i["var"]["rule"].string_value() == "annotation" &&
-          i["var"]["body"]["rule"].string_value() == "variable"
-        ) {
-          name = i["var"]["body"]["value"].string_value();
-          argt = annotation(i["var"]["type"]);
-        }
-        else if(i["var"]["rule"].string_value() == "variable") {
-          name = i["var"]["value"].string_value();
-          argt = wrap(Unknown());
-        }
-        if(name != "" && unique_check(context, def, name)) {
-          auto r = check(i["content"], context, def);
-          r.second.push_back(make_pair(r.first, argt));
-          unify(r.second);
-          def[name] = r.first;
-          continue;
-        }
-        throw WrongFormat();
-      }
-      else {
-        auto r = check(i, context, def);
-        unify(r.second);
-        cout << print(r.first) << endl;
-        continue;
-      }
+      cout << print(check(i, context)) << endl;
     }
     catch(WrongFormat) {
       cout << "wrong format" << endl;
